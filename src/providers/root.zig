@@ -163,6 +163,10 @@ pub const ChatMessage = struct {
     /// Optional multimodal content parts (images, etc.). When set, providers
     /// serialize these instead of the plain `content` field.
     content_parts: ?[]const ContentPart = null,
+    /// Pre-serialized native tool_calls JSON for an assistant message.
+    /// Lets history carry structured tool calls so the next request pairs
+    /// them with role=tool results (host-gate round trip).
+    tool_calls_json: ?[]const u8 = null,
 
     pub fn system(content: []const u8) ChatMessage {
         return .{ .role = .system, .content = content };

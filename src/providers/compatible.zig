@@ -217,6 +217,9 @@ pub const OpenAiCompatibleProvider = struct {
     /// Optional User-Agent header for HTTP requests.
     /// When set, requests will include "User-Agent: {value}" header.
     user_agent: ?[]const u8 = null,
+    /// Optional extra "Name: Value" header lines appended to every HTTP
+    /// request (e.g. gateway thread tags). Caller-owned; must outlive use.
+    extra_headers: ?[]const []const u8 = null,
     /// Primary OpenAI-compatible protocol to use for this provider.
     api_mode: CompatibleApiMode = .chat_completions,
     /// Maximum estimated request text bytes before streaming is skipped.
@@ -253,6 +256,19 @@ pub const OpenAiCompatibleProvider = struct {
     fn validateUserAgent(user_agent: []const u8) bool {
         // Disallow header injection and malformed values.
         return std.mem.indexOfAny(u8, user_agent, "\r\n") == null;
+    }
+
+    /// Append caller-supplied "Name: Value" header lines into a fixed buffer.
+    /// Silently drops lines with embedded CR/LF and any beyond capacity.
+    fn appendExtraHeaders(buf: [][]const u8, count: *usize, extra: ?[]const []const u8) void {
+        const lines = extra orelse return;
+        for (lines) |line| {
+            if (count.* >= buf.len) break;
+            if (line.len == 0 or std.mem.indexOfAny(u8, line, "\r\n") != null) continue;
+            if (std.mem.indexOfScalar(u8, line, ':') == null) continue;
+            buf[count.*] = line;
+            count.* += 1;
+        }
     }
 
     fn trimTrailingSlash(s: []const u8) []const u8 {
@@ -825,7 +841,7 @@ pub const OpenAiCompatibleProvider = struct {
             if (a.needs_free) allocator.free(a.value);
         };
 
-        var headers_buf: [2][]const u8 = undefined;
+        var headers_buf: [2 + 8][]const u8 = undefined;
         var header_count: usize = 0;
         if (auth) |a| {
             var auth_hdr_buf: [512]u8 = undefined;
@@ -841,6 +857,7 @@ pub const OpenAiCompatibleProvider = struct {
             headers_buf[header_count] = user_agent_hdr.?;
             header_count += 1;
         }
+        appendExtraHeaders(&headers_buf, &header_count, self.extra_headers);
 
         const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], timeout_secs) catch |err| return root.preserveCurlTransportError(err, error.CompatibleApiError);
         defer allocator.free(resp_body);
@@ -1237,8 +1254,8 @@ pub const OpenAiCompatibleProvider = struct {
         else
             null;
 
-        // Build extra headers (User-Agent if configured)
-        var extra_headers: [1][]const u8 = undefined;
+        // Build extra headers (User-Agent if configured, plus caller extras)
+        var extra_headers: [1 + 8][]const u8 = undefined;
         var extra_header_count: usize = 0;
         var user_agent_hdr: ?[]u8 = null;
         defer if (user_agent_hdr) |h| allocator.free(h);
@@ -1248,6 +1265,7 @@ pub const OpenAiCompatibleProvider = struct {
             extra_headers[extra_header_count] = user_agent_hdr.?;
             extra_header_count += 1;
         }
+        appendExtraHeaders(&extra_headers, &extra_header_count, self.extra_headers);
 
         var result = sse.curlStream(
             allocator,
@@ -1372,8 +1390,8 @@ pub const OpenAiCompatibleProvider = struct {
             if (a.needs_free) allocator.free(a.value);
         };
 
-        // Build headers (auth + optional User-Agent)
-        var headers_buf: [2][]const u8 = undefined;
+        // Build headers (auth + optional User-Agent + caller extras)
+        var headers_buf: [2 + 8][]const u8 = undefined;
         var header_count: usize = 0;
         if (auth) |a| {
             var auth_hdr_buf: [512]u8 = undefined;
@@ -1389,6 +1407,7 @@ pub const OpenAiCompatibleProvider = struct {
             headers_buf[header_count] = user_agent_hdr.?;
             header_count += 1;
         }
+        appendExtraHeaders(&headers_buf, &header_count, self.extra_headers);
 
         const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], 0) catch |err| return root.preserveCurlTransportError(err, error.CompatibleApiError);
         defer allocator.free(resp_body);
@@ -1464,8 +1483,8 @@ pub const OpenAiCompatibleProvider = struct {
             if (a.needs_free) allocator.free(a.value);
         };
 
-        // Build headers (auth + optional User-Agent)
-        var headers_buf: [2][]const u8 = undefined;
+        // Build headers (auth + optional User-Agent + caller extras)
+        var headers_buf: [2 + 8][]const u8 = undefined;
         var header_count: usize = 0;
         if (auth) |a| {
             var auth_hdr_buf: [512]u8 = undefined;
@@ -1481,6 +1500,7 @@ pub const OpenAiCompatibleProvider = struct {
             headers_buf[header_count] = user_agent_hdr.?;
             header_count += 1;
         }
+        appendExtraHeaders(&headers_buf, &header_count, self.extra_headers);
 
         const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], request.timeout_secs) catch |err| return root.preserveCurlTransportError(err, error.CompatibleApiError);
         defer allocator.free(resp_body);
@@ -1553,6 +1573,10 @@ fn serializeMessagesInto(
             if (msg.tool_call_id) |tc_id| {
                 try buf.appendSlice(allocator, ",\"tool_call_id\":");
                 try root.appendJsonString(buf, allocator, tc_id);
+            }
+            if (msg.tool_calls_json) |tc_json| {
+                try buf.appendSlice(allocator, ",\"tool_calls\":");
+                try buf.appendSlice(allocator, tc_json);
             }
             try buf.append(allocator, '}');
         }

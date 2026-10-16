@@ -415,6 +415,10 @@ pub const Agent = struct {
 
     /// Whether compaction was performed during the last turn.
     last_turn_compacted: bool = false,
+    /// When set, the next turn() skips appending the user message because
+    /// restored history already ends with it (kill -9 resume). Set by
+    /// continueTurn; turn() always clears it.
+    skip_next_user_append: bool = false,
 
     /// Whether context was force-compacted due to exhaustion during the current turn.
     context_was_compacted: bool = false,
@@ -423,13 +427,19 @@ pub const Agent = struct {
     pub const OwnedMessage = struct {
         role: providers.Role,
         content: []const u8,
+        /// Paired tool_call_id for role=tool messages (owned, freed with content).
+        tool_call_id: ?[]const u8 = null,
+        /// Pre-serialized native tool_calls JSON for assistant messages (owned).
+        tool_calls_json: ?[]const u8 = null,
 
         pub fn deinit(self: *const OwnedMessage, allocator: std.mem.Allocator) void {
             allocator.free(self.content);
+            if (self.tool_call_id) |id| allocator.free(id);
+            if (self.tool_calls_json) |tc| allocator.free(tc);
         }
 
         fn toChatMessage(self: *const OwnedMessage) ChatMessage {
-            return .{ .role = self.role, .content = self.content };
+            return .{ .role = self.role, .content = self.content, .tool_call_id = self.tool_call_id, .tool_calls_json = self.tool_calls_json };
         }
     };
 
@@ -2094,8 +2104,13 @@ pub const Agent = struct {
             self.system_prompt_model_name = try self.allocator.dupe(u8, turn_model_name);
         }
 
+        // Resume path (continueTurn): the user message is already the last
+        // user entry in restored history. Skip auto-save, enrichment and
+        // append so the interrupted turn continues instead of restarting.
+        const resume_turn = self.skip_next_user_append;
+        self.skip_next_user_append = false;
         // Auto-save user message to memory (nanoTimestamp key to avoid collisions within the same second)
-        if (self.auto_save) {
+        if (self.auto_save and !resume_turn) {
             if (self.mem) |mem| {
                 const ts: u128 = @bitCast(std_compat.time.nanoTimestamp());
                 const save_key = std.fmt.allocPrint(self.allocator, "autosave_user_{d}", .{ts}) catch null;
@@ -2113,14 +2128,17 @@ pub const Agent = struct {
 
         // Enrich message with memory context (always returns owned slice; ownership → history)
         // Uses retrieval pipeline (hybrid search, RRF, temporal decay, MMR) when MemoryRuntime is available.
-        const enriched_raw = if (self.mem) |mem|
-            try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, safe_user_message, self.memory_session_id)
-        else
-            try self.allocator.dupe(u8, safe_user_message);
-        const enriched = try self.redactOwnedForHistory(enriched_raw);
+        // Skipped on resume: history already holds the enriched user message.
+        if (!resume_turn) {
+            const enriched_raw = if (self.mem) |mem|
+                try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, safe_user_message, self.memory_session_id)
+            else
+                try self.allocator.dupe(u8, safe_user_message);
+            const enriched = try self.redactOwnedForHistory(enriched_raw);
 
-        // Keep the user message retained even if provider/tool steps fail.
-        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = enriched });
+            // Keep the user message retained even if provider/tool steps fail.
+            try self.appendOwnedHistoryMessage(.{ .role = .user, .content = enriched });
+        }
 
         var sys_bytes: usize = 0;
         var hist_bytes: usize = 0;
@@ -2701,9 +2719,23 @@ pub const Agent = struct {
                 break :blk assistant_history_content;
             } else try self.allocator.dupe(u8, assistant_history_content);
 
-            // Once appended, history owns the buffer.
+            // Native round trip: when every call carries an id, keep the
+            // structured tool_calls on the assistant message and follow with
+            // one role=tool message per result below, instead of folding
+            // results into a user-role text block. The provider then sees a
+            // well-formed call/result pairing on the next request.
+            // On append failure the message deinit frees both buffers.
+            var native_tool_calls_json: ?[]const u8 = null;
+            if (use_native) {
+                if (try dispatcher.buildNativeToolCallsJson(self.allocator, parsed_calls)) |tc_json| {
+                    native_tool_calls_json = try self.redactOwnedForHistory(tc_json);
+                }
+            }
+            const native_round_trip = native_tool_calls_json != null;
+
+            // Once appended, history owns the buffers.
             const safe_assistant_content = try self.redactOwnedForHistory(assistant_content);
-            try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = safe_assistant_content });
+            try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = safe_assistant_content, .tool_calls_json = native_tool_calls_json });
 
             // Execute each tool call
             var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
@@ -2790,21 +2822,36 @@ pub const Agent = struct {
                 try results_buf.append(self.allocator, result);
             }
 
-            // Format tool results, scrub credentials, add reflection prompt, and add to history
+            // Format tool results, scrub credentials, and add to history.
             const formatted_results = try dispatcher.formatToolResults(arena, results_buf.items);
             const scrubbed_results = try providers.scrubToolOutput(arena, formatted_results);
             const redacted_results = if (self.redactor) |r| try r.redact(arena, scrubbed_results) else scrubbed_results;
-            const with_reflection = try std.fmt.allocPrint(
-                arena,
-                "{s}\n\nReflect on the tool results above and decide your next steps. " ++
-                    "If a tool failed due to policy/permissions, do not repeat the same blocked call; explain the limitation and choose a different available tool or ask the user for permission/config change. " ++
-                    "If a tool failed due to a transient issue (timeout/network/rate-limit), proactively retry up to 2 times with adjusted parameters before giving up.",
-                .{redacted_results},
-            );
-            try self.history.append(self.allocator, .{
-                .role = .user,
-                .content = try self.allocator.dupe(u8, with_reflection),
-            });
+            if (native_round_trip) {
+                // Native round trip: one role=tool message per result, paired
+                // with the assistant tool_calls above by tool_call_id.
+                for (parsed_calls, 0..) |call, idx| {
+                    const result = results_buf.items[idx];
+                    const id = call.tool_call_id orelse continue; // ids verified present above
+                    const scrubbed = try providers.scrubToolOutput(arena, result.output);
+                    try self.appendOwnedHistoryMessage(.{
+                        .role = .tool,
+                        .content = try self.redactOwnedForHistory(try self.allocator.dupe(u8, scrubbed)),
+                        .tool_call_id = try self.allocator.dupe(u8, id),
+                    });
+                }
+            } else {
+                const with_reflection = try std.fmt.allocPrint(
+                    arena,
+                    "{s}\n\nReflect on the tool results above and decide your next steps. " ++
+                        "If a tool failed due to policy/permissions, do not repeat the same blocked call; explain the limitation and choose a different available tool or ask the user for permission/config change. " ++
+                        "If a tool failed due to a transient issue (timeout/network/rate-limit), proactively retry up to 2 times with adjusted parameters before giving up.",
+                        .{redacted_results},
+                    );
+                try self.history.append(self.allocator, .{
+                    .role = .user,
+                    .content = try self.allocator.dupe(u8, with_reflection),
+                });
+            }
 
             self.trimHistory();
 
@@ -3832,6 +3879,16 @@ pub const Agent = struct {
         return self.turn(message);
     }
 
+    /// Continue an interrupted turn after restoring history (kill -9 resume).
+    /// History must already end with the in-progress turn's messages
+    /// (user prompt, plus any assistant tool_calls and role=tool results).
+    /// Skips appending a new user message; the loop resumes from the last
+    /// assistant/tool pair, so finished tools never re-run.
+    pub fn continueTurn(self: *Agent) ![]const u8 {
+        self.skip_next_user_append = true;
+        return self.turn("");
+    }
+
     /// Clear conversation history (for starting a new session).
     pub fn clearHistory(self: *Agent) void {
         for (self.history.items) |*msg| {
@@ -3873,8 +3930,57 @@ pub const Agent = struct {
         }
     }
 
+    /// Full-fidelity history entry (includes native tool round-trip fields).
+    pub const HistoryEntry = struct {
+        role: providers.Role,
+        content: []const u8,
+        tool_call_id: ?[]const u8 = null,
+        tool_calls_json: ?[]const u8 = null,
+    };
+
+    /// Snapshot full history for host-side persistence (kill -9 resume).
+    /// Caller owns all strings; free with freeHistoryEntries.
+    pub fn dumpHistory(self: *const Agent, allocator: std.mem.Allocator) ![]HistoryEntry {
+        const result = try allocator.alloc(HistoryEntry, self.history.items.len);
+        errdefer allocator.free(result);
+        for (self.history.items, 0..) |*msg, i| {
+            result[i] = .{
+                .role = msg.role,
+                .content = try allocator.dupe(u8, msg.content),
+                .tool_call_id = if (msg.tool_call_id) |id| try allocator.dupe(u8, id) else null,
+                .tool_calls_json = if (msg.tool_calls_json) |tc| try allocator.dupe(u8, tc) else null,
+            };
+        }
+        return result;
+    }
+
+    /// Free entries from dumpHistory.
+    pub fn freeHistoryEntries(allocator: std.mem.Allocator, entries: []HistoryEntry) void {
+        for (entries) |entry| {
+            allocator.free(entry.content);
+            if (entry.tool_call_id) |id| allocator.free(id);
+            if (entry.tool_calls_json) |tc| allocator.free(tc);
+        }
+        allocator.free(entries);
+    }
+
+    /// Restore a dumpHistory snapshot into a fresh agent (kill -9 resume).
+    /// The system prompt entry (if first) is kept as-is; turn() rebuilds it
+    /// deterministically when the workspace fingerprint changed.
+    pub fn restoreHistory(self: *Agent, entries: []const HistoryEntry) !void {
+        for (entries) |entry| {
+            try self.history.append(self.allocator, .{
+                .role = entry.role,
+                .content = try self.allocator.dupe(u8, entry.content),
+                .tool_call_id = if (entry.tool_call_id) |id| try self.allocator.dupe(u8, id) else null,
+                .tool_calls_json = if (entry.tool_calls_json) |tc| try self.allocator.dupe(u8, tc) else null,
+            });
+        }
+    }
+
     /// Get history entries as role-string + content pairs (for persistence).
     /// Caller owns the returned slice but NOT the inner strings (borrows from history).
+    /// Note: drops tool roles and native tool_calls; prefer dumpHistory.
     pub fn getHistory(self: *const Agent, allocator: std.mem.Allocator) ![]struct { role: []const u8, content: []const u8 } {
         const Pair = struct { role: []const u8, content: []const u8 };
         const result = try allocator.alloc(Pair, self.history.items.len);

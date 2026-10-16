@@ -635,6 +635,35 @@ pub fn buildAssistantHistoryWithToolCalls(
     return buf.toOwnedSlice(allocator);
 }
 
+/// Build a native OpenAI `tool_calls` JSON array for one assistant message.
+///
+/// Each entry is `{"id","type":"function","function":{"name","arguments"}}`
+/// where `arguments` stays a JSON-encoded string, mirroring the wire format.
+/// Returns null when any call lacks an id (native round trip needs ids for
+/// the follow-up role=tool messages); the caller then keeps the XML fallback.
+pub fn buildNativeToolCallsJson(
+    allocator: std.mem.Allocator,
+    parsed_calls: []const ParsedToolCall,
+) !?[]const u8 {
+    for (parsed_calls) |call| {
+        if (call.tool_call_id == null or call.tool_call_id.?.len == 0) return null;
+    }
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, '[');
+    for (parsed_calls, 0..) |call, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, "{\"id\":");
+        try providers.appendJsonString(&buf, allocator, call.tool_call_id.?);
+        try buf.appendSlice(allocator, ",\"type\":\"function\",\"function\":{\"name\":");
+        try providers.appendJsonString(&buf, allocator, call.name);
+        try buf.appendSlice(allocator, ",\"arguments\":");
+        try providers.appendJsonString(&buf, allocator, call.arguments_json);
+        try buf.appendSlice(allocator, "}}");
+    }
+    try buf.append(allocator, ']');
+    return try buf.toOwnedSlice(allocator);
+}
 // ── Internal helpers ────────────────────────────────────────────────────
 
 /// Strip trailing XML tags (e.g. </arg_value>, </tool_call>) from a string.

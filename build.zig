@@ -594,6 +594,32 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    // ---------- bench driver executable (t-0582 harness workload) ----------
+    // Built on demand: `zig build bench -Dchannels=cli -Dembedded_wasm3=false`.
+    // Shares the nullclaw library module; links SQLite the same way.
+    if (!is_wasi and lib_mod != null) {
+        const bench_root = b.createModule(.{
+            .root_source_file = b.path("src/bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = exe_imports,
+        });
+        const bench_exe = b.addExecutable(.{
+            .name = "bench",
+            .root_module = bench_root,
+        });
+        if (sqlite3) |lib| {
+            bench_exe.root_module.linkLibrary(lib);
+        }
+        if (optimize != .Debug) {
+            bench_exe.root_module.strip = true;
+            bench_exe.root_module.unwind_tables = .none;
+            bench_exe.root_module.omit_frame_pointer = true;
+        }
+        const bench_step = b.step("bench", "Build the t-0582 bench driver");
+        bench_step.dependOn(&b.addInstallArtifact(bench_exe, .{}).step);
+    }
+
     // macOS host+target only: strip local symbols post-install.
     // Host `strip` cannot process ELF/PE during cross-builds.
     if (optimize != .Debug and builtin.os.tag == .macos and target.result.os.tag == .macos) {
