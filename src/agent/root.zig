@@ -419,7 +419,9 @@ pub const Agent = struct {
     /// restored history already ends with it (kill -9 resume). Set by
     /// continueTurn; turn() always clears it.
     skip_next_user_append: bool = false,
-
+    /// When set, turn() never writes intermediary model text to stdout.
+    /// Host-driven embeddings need a clean stdout protocol.
+    suppress_turn_chatter: bool = false,
     /// Whether context was force-compacted due to exhaustion during the current turn.
     context_was_compacted: bool = false,
 
@@ -2702,7 +2704,9 @@ pub const Agent = struct {
             // There are tool calls — print intermediary text.
             // In tests, stdout is used by Zig's test runner protocol (`--listen`),
             // so avoid writing arbitrary text that can corrupt the control channel.
-            if (!builtin.is_test and display_text.len > 0 and parsed_calls.len > 0 and !is_streaming) {
+            // Host-driven embeddings (bench driver) set suppress_turn_chatter so
+            // model chatter never interleaves with the host's stdout protocol.
+            if (!builtin.is_test and !self.suppress_turn_chatter and display_text.len > 0 and parsed_calls.len > 0 and !is_streaming) {
                 var out_buf: [4096]u8 = undefined;
                 var bw = std_compat.fs.File.stdout().writerStreaming(&out_buf);
                 const w = &bw.interface;

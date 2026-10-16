@@ -333,7 +333,6 @@ pub fn main(init: std.process.Init) !void {
         .workspace_dir = workdir,
         .config_path = "bench",
         .allocator = alloc,
-        .default_provider = "bench",
         .default_model = model,
         .default_temperature = 0,
         .agent = .{
@@ -372,9 +371,10 @@ pub fn main(init: std.process.Init) !void {
         s.obs = .{ .ctx = &s.ctx };
         s.tools = .{ s.echo.tool(), s.delete.tool() };
         s.agent = try Agent.fromConfig(alloc, &cfg, provider, &s.tools, null, s.obs.observer());
+        // Keep stdout a clean event stream: NullClaw otherwise prints model
+        // chatter without a newline, which corrupts host-protocol lines.
+        s.agent.suppress_turn_chatter = true;
         s.ctx.agent = &s.agent;
-        s.agent.usage_record_callback = &recordUsage;
-        s.agent.usage_record_ctx = @ptrCast(s);
         var pb: [1024]u8 = undefined;
         const path = try std.fmt.bufPrint(&pb, "{s}/s{d}.json", .{ store, id });
         _ = restoreFile(alloc, &s.agent, path) catch false;
